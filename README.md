@@ -1,9 +1,9 @@
-# chalk
+# inkblot
 
 Fast, simple plotting for scientists. Rust-powered, no matplotlib required.
 
 ```python
-import chalk
+import inkblot
 
 # coming soon
 ```

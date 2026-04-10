@@ -26,7 +26,7 @@ Homepage = "https://github.com/zgazak/inkblot"
 Repository = "https://github.com/zgazak/inkblot"
 
 [tool.hatch.build.targets.wheel]
-packages = ["chalk"]
+packages = ["inkblot"]
 
 [dependency-groups]
 dev = []
