@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use tiny_skia::*;
 
-use crate::colors::paint_from_rgba;
+use crate::colors::{colormap, paint_from_rgba};
 use crate::layout::{compute_layout, format_tick, Layout};
 use crate::text;
 
@@ -13,7 +13,9 @@ use crate::text;
 pub struct PlotSpec {
     pub width: u32,
     pub height: u32,
+    pub frameless: bool,
     pub traces: Vec<Trace>,
+    pub overlays: Vec<Overlay>,
     pub title: Option<String>,
     pub xlabel: Option<String>,
     pub ylabel: Option<String>,
@@ -39,6 +41,41 @@ pub enum Trace {
         cols: usize,
         vmin: f64,
         vmax: f64,
+        cmap: String,
+    },
+}
+
+pub enum Overlay {
+    Circle {
+        x: f32,
+        y: f32,
+        radius: f32,
+        color: [u8; 4],
+        filled: bool,
+        linewidth: f32,
+    },
+    Crosshair {
+        x: f32,
+        y: f32,
+        size: f32,
+        gap: f32,
+        color: [u8; 4],
+        linewidth: f32,
+    },
+    Polyline {
+        xs: Vec<f32>,
+        ys: Vec<f32>,
+        color: [u8; 4],
+        linewidth: f32,
+    },
+    Label {
+        x: f32,
+        y: f32,
+        text: String,
+        font_size: f32,
+        color: [u8; 4],
+        bg_color: Option<[u8; 4]>,
+        rotation: f32,
     },
 }
 
@@ -73,6 +110,34 @@ impl CoordTransform {
 // Deserialization from Python dict
 // ---------------------------------------------------------------------------
 
+fn extract_color(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<[u8; 4]> {
+    let list: Vec<u8> = dict
+        .get_item(key)?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?
+        .extract()?;
+    Ok([
+        list.first().copied().unwrap_or(0),
+        list.get(1).copied().unwrap_or(0),
+        list.get(2).copied().unwrap_or(0),
+        list.get(3).copied().unwrap_or(255),
+    ])
+}
+
+fn extract_optional_color(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<[u8; 4]>> {
+    match dict.get_item(key)? {
+        Some(v) if !v.is_none() => {
+            let list: Vec<u8> = v.extract()?;
+            Ok(Some([
+                list.first().copied().unwrap_or(0),
+                list.get(1).copied().unwrap_or(0),
+                list.get(2).copied().unwrap_or(0),
+                list.get(3).copied().unwrap_or(255),
+            ]))
+        }
+        _ => Ok(None),
+    }
+}
+
 impl PlotSpec {
     pub fn from_pydict(spec: &Bound<'_, PyDict>) -> PyResult<Self> {
         let width: u32 = spec
@@ -83,6 +148,10 @@ impl PlotSpec {
             .get_item("height")?
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("height"))?
             .extract()?;
+        let frameless: bool = spec
+            .get_item("frameless")?
+            .map(|v| v.extract().unwrap_or(false))
+            .unwrap_or(false);
         let title: Option<String> = spec
             .get_item("title")?
             .and_then(|v| if v.is_none() { None } else { Some(v) })
@@ -103,6 +172,7 @@ impl PlotSpec {
             .map(|v| v.extract().unwrap_or(false))
             .unwrap_or(false);
 
+        // Parse traces
         let traces_list: Bound<'_, PyList> = spec
             .get_item("traces")?
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("traces"))?
@@ -110,90 +180,93 @@ impl PlotSpec {
 
         let mut traces = Vec::new();
         for item in traces_list.iter() {
-            let trace_dict: &Bound<'_, PyDict> = item.downcast()?;
-            let kind: String = trace_dict
+            let d: &Bound<'_, PyDict> = item.downcast()?;
+            let kind: String = d
                 .get_item("kind")?
                 .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("kind"))?
                 .extract()?;
 
             match kind.as_str() {
                 "line" | "scatter" => {
-                    let x: Vec<f64> = trace_dict
-                        .get_item("x")?
-                        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("x"))?
-                        .extract()?;
-                    let y: Vec<f64> = trace_dict
-                        .get_item("y")?
-                        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("y"))?
-                        .extract()?;
-                    let color_list: Vec<u8> = trace_dict
-                        .get_item("color")?
-                        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("color"))?
-                        .extract()?;
-                    let color = [
-                        color_list.first().copied().unwrap_or(0),
-                        color_list.get(1).copied().unwrap_or(0),
-                        color_list.get(2).copied().unwrap_or(0),
-                        color_list.get(3).copied().unwrap_or(255),
-                    ];
-
+                    let x: Vec<f64> = d.get_item("x")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("x"))?.extract()?;
+                    let y: Vec<f64> = d.get_item("y")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("y"))?.extract()?;
+                    let color = extract_color(d, "color")?;
                     if kind == "line" {
-                        let linewidth: f32 = trace_dict
-                            .get_item("linewidth")?
-                            .map(|v| v.extract().unwrap_or(1.5))
-                            .unwrap_or(1.5);
-                        traces.push(Trace::Line {
-                            x,
-                            y,
-                            color,
-                            linewidth,
-                        });
+                        let linewidth: f32 = d.get_item("linewidth")?.map(|v| v.extract().unwrap_or(1.5)).unwrap_or(1.5);
+                        traces.push(Trace::Line { x, y, color, linewidth });
                     } else {
-                        let size: f32 = trace_dict
-                            .get_item("size")?
-                            .map(|v| v.extract().unwrap_or(3.0))
-                            .unwrap_or(3.0);
-                        traces.push(Trace::Scatter {
-                            x,
-                            y,
-                            color,
-                            size,
-                        });
+                        let size: f32 = d.get_item("size")?.map(|v| v.extract().unwrap_or(3.0)).unwrap_or(3.0);
+                        traces.push(Trace::Scatter { x, y, color, size });
                     }
                 }
                 "imshow" => {
-                    let data: Vec<f64> = trace_dict
-                        .get_item("data")?
-                        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("data"))?
-                        .extract()?;
-                    let rows: usize = trace_dict
-                        .get_item("rows")?
-                        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("rows"))?
-                        .extract()?;
-                    let cols: usize = trace_dict
-                        .get_item("cols")?
-                        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("cols"))?
-                        .extract()?;
-                    let vmin: f64 = trace_dict
-                        .get_item("vmin")?
-                        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("vmin"))?
-                        .extract()?;
-                    let vmax: f64 = trace_dict
-                        .get_item("vmax")?
-                        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("vmax"))?
-                        .extract()?;
-                    traces.push(Trace::Imshow {
-                        data,
-                        rows,
-                        cols,
-                        vmin,
-                        vmax,
-                    });
+                    let data: Vec<f64> = d.get_item("data")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("data"))?.extract()?;
+                    let rows: usize = d.get_item("rows")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("rows"))?.extract()?;
+                    let cols: usize = d.get_item("cols")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("cols"))?.extract()?;
+                    let vmin: f64 = d.get_item("vmin")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("vmin"))?.extract()?;
+                    let vmax: f64 = d.get_item("vmax")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("vmax"))?.extract()?;
+                    let cmap: String = d.get_item("cmap")?.map(|v| v.extract().unwrap_or_else(|_| "viridis".to_string())).unwrap_or_else(|| "viridis".to_string());
+                    traces.push(Trace::Imshow { data, rows, cols, vmin, vmax, cmap });
                 }
                 other => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "unknown trace kind: {other}"
-                    )));
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!("unknown trace kind: {other}")));
+                }
+            }
+        }
+
+        // Parse overlays
+        let mut overlays = Vec::new();
+        if let Some(overlays_obj) = spec.get_item("overlays")? {
+            if !overlays_obj.is_none() {
+                let overlays_list: Bound<'_, PyList> = overlays_obj.downcast_into()?;
+                for item in overlays_list.iter() {
+                    let d: &Bound<'_, PyDict> = item.downcast()?;
+                    let kind: String = d.get_item("kind")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("kind"))?.extract()?;
+
+                    match kind.as_str() {
+                        "circle" => {
+                            overlays.push(Overlay::Circle {
+                                x: d.get_item("x")?.unwrap().extract()?,
+                                y: d.get_item("y")?.unwrap().extract()?,
+                                radius: d.get_item("radius")?.unwrap().extract()?,
+                                color: extract_color(d, "color")?,
+                                filled: d.get_item("filled")?.map(|v| v.extract().unwrap_or(false)).unwrap_or(false),
+                                linewidth: d.get_item("linewidth")?.map(|v| v.extract().unwrap_or(1.5)).unwrap_or(1.5),
+                            });
+                        }
+                        "crosshair" => {
+                            overlays.push(Overlay::Crosshair {
+                                x: d.get_item("x")?.unwrap().extract()?,
+                                y: d.get_item("y")?.unwrap().extract()?,
+                                size: d.get_item("size")?.map(|v| v.extract().unwrap_or(15.0)).unwrap_or(15.0),
+                                gap: d.get_item("gap")?.map(|v| v.extract().unwrap_or(3.0)).unwrap_or(3.0),
+                                color: extract_color(d, "color")?,
+                                linewidth: d.get_item("linewidth")?.map(|v| v.extract().unwrap_or(1.5)).unwrap_or(1.5),
+                            });
+                        }
+                        "polyline" => {
+                            overlays.push(Overlay::Polyline {
+                                xs: d.get_item("xs")?.unwrap().extract()?,
+                                ys: d.get_item("ys")?.unwrap().extract()?,
+                                color: extract_color(d, "color")?,
+                                linewidth: d.get_item("linewidth")?.map(|v| v.extract().unwrap_or(1.0)).unwrap_or(1.0),
+                            });
+                        }
+                        "label" => {
+                            overlays.push(Overlay::Label {
+                                x: d.get_item("x")?.unwrap().extract()?,
+                                y: d.get_item("y")?.unwrap().extract()?,
+                                text: d.get_item("text")?.unwrap().extract()?,
+                                font_size: d.get_item("font_size")?.map(|v| v.extract().unwrap_or(12.0)).unwrap_or(12.0),
+                                color: extract_color(d, "color")?,
+                                bg_color: extract_optional_color(d, "bg_color")?,
+                                rotation: d.get_item("rotation")?.map(|v| v.extract().unwrap_or(0.0)).unwrap_or(0.0),
+                            });
+                        }
+                        other => {
+                            return Err(pyo3::exceptions::PyValueError::new_err(format!("unknown overlay kind: {other}")));
+                        }
+                    }
                 }
             }
         }
@@ -201,7 +274,9 @@ impl PlotSpec {
         Ok(PlotSpec {
             width,
             height,
+            frameless,
             traces,
+            overlays,
             title,
             xlabel,
             ylabel,
@@ -219,85 +294,96 @@ pub fn render_plot(spec: &PlotSpec) -> PyResult<Vec<u8>> {
         pyo3::exceptions::PyValueError::new_err("failed to create pixmap (invalid dimensions)")
     })?;
 
-    // White background
-    pixmap.fill(Color::WHITE);
+    if spec.frameless {
+        // Frameless: black background, no margins, image fills entire pixmap
+        pixmap.fill(Color::BLACK);
 
-    // Compute data bounds across all traces
-    let (x_min, x_max, y_min, y_max) = data_bounds(&spec.traces);
+        let ct = CoordTransform {
+            x_min: 0.0,
+            x_max: spec.width as f64,
+            y_min: 0.0,
+            y_max: spec.height as f64,
+            plot_left: 0.0,
+            plot_right: spec.width as f32,
+            plot_top: 0.0,
+            plot_bottom: spec.height as f32,
+        };
 
-    // Compute layout
-    let layout = compute_layout(
-        x_min,
-        x_max,
-        y_min,
-        y_max,
-        spec.title.is_some(),
-        spec.xlabel.is_some(),
-        spec.ylabel.is_some(),
-    );
+        for trace in &spec.traces {
+            match trace {
+                Trace::Imshow { data, rows, cols, vmin, vmax, cmap } => {
+                    draw_imshow(&mut pixmap, data, *rows, *cols, *vmin, *vmax, cmap, &ct);
+                }
+                Trace::Line { x, y, color, linewidth } => {
+                    draw_line(&mut pixmap, x, y, *color, *linewidth, &ct);
+                }
+                Trace::Scatter { x, y, color, size } => {
+                    draw_scatter(&mut pixmap, x, y, *color, *size, &ct);
+                }
+            }
+        }
+    } else {
+        // Normal mode: white background, margins, axes
+        pixmap.fill(Color::WHITE);
 
-    let ct = CoordTransform {
-        x_min,
-        x_max,
-        y_min,
-        y_max,
-        plot_left: layout.plot_left(),
-        plot_right: layout.plot_right(spec.width),
-        plot_top: layout.plot_top(),
-        plot_bottom: layout.plot_bottom(spec.height),
-    };
+        let (x_min, x_max, y_min, y_max) = data_bounds(&spec.traces);
+        let layout = compute_layout(
+            x_min, x_max, y_min, y_max,
+            spec.title.is_some(), spec.xlabel.is_some(), spec.ylabel.is_some(),
+        );
 
-    // Draw components
-    if spec.grid {
-        draw_grid(&mut pixmap, &layout, &ct, spec.width, spec.height);
-    }
-    draw_axes(&mut pixmap, &layout, spec.width, spec.height);
-    draw_ticks(&mut pixmap, &layout, &ct, spec.width, spec.height);
+        let ct = CoordTransform {
+            x_min, x_max, y_min, y_max,
+            plot_left: layout.plot_left(),
+            plot_right: layout.plot_right(spec.width),
+            plot_top: layout.plot_top(),
+            plot_bottom: layout.plot_bottom(spec.height),
+        };
 
-    // Draw traces (clipped to plot area)
-    for trace in &spec.traces {
-        match trace {
-            Trace::Line {
-                x,
-                y,
-                color,
-                linewidth,
-            } => draw_line(&mut pixmap, x, y, *color, *linewidth, &ct),
-            Trace::Scatter {
-                x,
-                y,
-                color,
-                size,
-            } => draw_scatter(&mut pixmap, x, y, *color, *size, &ct),
-            Trace::Imshow {
-                data,
-                rows,
-                cols,
-                vmin,
-                vmax,
-            } => draw_imshow(&mut pixmap, data, *rows, *cols, *vmin, *vmax, &ct),
+        if spec.grid {
+            draw_grid(&mut pixmap, &layout, &ct, spec.width, spec.height);
+        }
+        draw_axes(&mut pixmap, &layout, spec.width, spec.height);
+        draw_ticks(&mut pixmap, &layout, &ct, spec.width, spec.height);
+
+        for trace in &spec.traces {
+            match trace {
+                Trace::Line { x, y, color, linewidth } => draw_line(&mut pixmap, x, y, *color, *linewidth, &ct),
+                Trace::Scatter { x, y, color, size } => draw_scatter(&mut pixmap, x, y, *color, *size, &ct),
+                Trace::Imshow { data, rows, cols, vmin, vmax, cmap } => draw_imshow(&mut pixmap, data, *rows, *cols, *vmin, *vmax, cmap, &ct),
+            }
+        }
+
+        if let Some(ref title) = spec.title {
+            let cx = (layout.plot_left() + layout.plot_right(spec.width)) / 2.0;
+            text::draw_text_centered(&mut pixmap, title, cx, layout.plot_top() - 12.0, 18.0, [0, 0, 0, 255]);
+        }
+        if let Some(ref xlabel) = spec.xlabel {
+            let cx = (layout.plot_left() + layout.plot_right(spec.width)) / 2.0;
+            text::draw_text_centered(&mut pixmap, xlabel, cx, layout.plot_bottom(spec.height) + 45.0, 14.0, [0, 0, 0, 255]);
+        }
+        if let Some(ref ylabel) = spec.ylabel {
+            let cy = (layout.plot_top() + layout.plot_bottom(spec.height)) / 2.0;
+            text::draw_text_rotated(&mut pixmap, ylabel, 18.0, cy, 14.0, [0, 0, 0, 255]);
         }
     }
 
-    // Draw labels
-    if let Some(ref title) = spec.title {
-        let cx = (layout.plot_left() + layout.plot_right(spec.width)) / 2.0;
-        text::draw_text_centered(&mut pixmap, title, cx, layout.plot_top() - 12.0, 18.0, [0, 0, 0, 255]);
-    }
-    if let Some(ref xlabel) = spec.xlabel {
-        let cx = (layout.plot_left() + layout.plot_right(spec.width)) / 2.0;
-        text::draw_text_centered(
-            &mut pixmap,
-            xlabel,
-            cx,
-            layout.plot_bottom(spec.height) + 45.0,
-            14.0,
-            [0, 0, 0, 255],
-        );
-    }
-    if let Some(ref ylabel) = spec.ylabel {
-        let cy = (layout.plot_top() + layout.plot_bottom(spec.height)) / 2.0;
-        text::draw_text_rotated(&mut pixmap, ylabel, 18.0, cy, 14.0, [0, 0, 0, 255]);
+    // Draw overlays on top of everything
+    for overlay in &spec.overlays {
+        match overlay {
+            Overlay::Circle { x, y, radius, color, filled, linewidth } => {
+                draw_overlay_circle(&mut pixmap, *x, *y, *radius, *color, *filled, *linewidth);
+            }
+            Overlay::Crosshair { x, y, size, gap, color, linewidth } => {
+                draw_overlay_crosshair(&mut pixmap, *x, *y, *size, *gap, *color, *linewidth);
+            }
+            Overlay::Polyline { xs, ys, color, linewidth } => {
+                draw_overlay_polyline(&mut pixmap, xs, ys, *color, *linewidth);
+            }
+            Overlay::Label { x, y, text, font_size, color, bg_color, rotation } => {
+                draw_overlay_label(&mut pixmap, *x, *y, text, *font_size, *color, *bg_color, *rotation);
+            }
+        }
     }
 
     pixmap
@@ -318,17 +404,10 @@ fn data_bounds(traces: &[Trace]) -> (f64, f64, f64, f64) {
     for trace in traces {
         match trace {
             Trace::Line { x, y, .. } | Trace::Scatter { x, y, .. } => {
-                for &v in x {
-                    if v < x_min { x_min = v; }
-                    if v > x_max { x_max = v; }
-                }
-                for &v in y {
-                    if v < y_min { y_min = v; }
-                    if v > y_max { y_max = v; }
-                }
+                for &v in x { if v < x_min { x_min = v; } if v > x_max { x_max = v; } }
+                for &v in y { if v < y_min { y_min = v; } if v > y_max { y_max = v; } }
             }
             Trace::Imshow { rows, cols, .. } => {
-                // Imshow covers [0, cols] x [0, rows] in data space
                 if 0.0 < x_min { x_min = 0.0; }
                 if (*cols as f64) > x_max { x_max = *cols as f64; }
                 if 0.0 < y_min { y_min = 0.0; }
@@ -337,23 +416,20 @@ fn data_bounds(traces: &[Trace]) -> (f64, f64, f64, f64) {
         }
     }
 
-    // For imshow-only plots, skip padding
     let has_imshow = traces.iter().any(|t| matches!(t, Trace::Imshow { .. }));
     if has_imshow {
         return (x_min, x_max, y_min, y_max);
     }
 
-    // Add 5% padding
     let x_pad = (x_max - x_min).abs() * 0.05;
     let y_pad = (y_max - y_min).abs() * 0.05;
     let x_pad = if x_pad < 1e-12 { 1.0 } else { x_pad };
     let y_pad = if y_pad < 1e-12 { 1.0 } else { y_pad };
-
     (x_min - x_pad, x_max + x_pad, y_min - y_pad, y_max + y_pad)
 }
 
 // ---------------------------------------------------------------------------
-// Drawing functions
+// Axes drawing (normal mode only)
 // ---------------------------------------------------------------------------
 
 fn draw_axes(pixmap: &mut Pixmap, layout: &Layout, width: u32, height: u32) {
@@ -366,7 +442,6 @@ fn draw_axes(pixmap: &mut Pixmap, layout: &Layout, width: u32, height: u32) {
     let top = layout.plot_top();
     let bottom = layout.plot_bottom(height);
 
-    // Single closed rectangle — square corners, no endpoint gaps
     let mut pb = PathBuilder::new();
     pb.move_to(left, top);
     pb.line_to(right, top);
@@ -408,13 +483,7 @@ fn draw_grid(pixmap: &mut Pixmap, layout: &Layout, ct: &CoordTransform, width: u
     }
 }
 
-fn draw_ticks(
-    pixmap: &mut Pixmap,
-    layout: &Layout,
-    ct: &CoordTransform,
-    width: u32,
-    height: u32,
-) {
+fn draw_ticks(pixmap: &mut Pixmap, layout: &Layout, ct: &CoordTransform, width: u32, height: u32) {
     let paint = paint_from_rgba([0, 0, 0, 255]);
     let mut stroke = Stroke::default();
     stroke.width = 1.0;
@@ -425,18 +494,9 @@ fn draw_ticks(
     let bottom = layout.plot_bottom(height);
     let tick_len = 6.0;
 
-    let x_step = if layout.x_ticks.len() >= 2 {
-        (layout.x_ticks[1] - layout.x_ticks[0]).abs()
-    } else {
-        1.0
-    };
-    let y_step = if layout.y_ticks.len() >= 2 {
-        (layout.y_ticks[1] - layout.y_ticks[0]).abs()
-    } else {
-        1.0
-    };
+    let x_step = if layout.x_ticks.len() >= 2 { (layout.x_ticks[1] - layout.x_ticks[0]).abs() } else { 1.0 };
+    let y_step = if layout.y_ticks.len() >= 2 { (layout.y_ticks[1] - layout.y_ticks[0]).abs() } else { 1.0 };
 
-    // X ticks
     for &xv in &layout.x_ticks {
         let (px, _) = ct.data_to_pixel(xv, 0.0);
         if px >= left && px <= right {
@@ -448,7 +508,6 @@ fn draw_ticks(
         }
     }
 
-    // Y ticks
     for &yv in &layout.y_ticks {
         let (_, py) = ct.data_to_pixel(0.0, yv);
         if py >= top && py <= bottom {
@@ -462,17 +521,12 @@ fn draw_ticks(
     }
 }
 
-fn draw_line(
-    pixmap: &mut Pixmap,
-    x: &[f64],
-    y: &[f64],
-    color: [u8; 4],
-    linewidth: f32,
-    ct: &CoordTransform,
-) {
-    if x.len() < 2 {
-        return;
-    }
+// ---------------------------------------------------------------------------
+// Trace drawing
+// ---------------------------------------------------------------------------
+
+fn draw_line(pixmap: &mut Pixmap, x: &[f64], y: &[f64], color: [u8; 4], linewidth: f32, ct: &CoordTransform) {
+    if x.len() < 2 { return; }
     let mut pb = PathBuilder::new();
     let (px, py) = ct.data_to_pixel(x[0], y[0]);
     pb.move_to(px, py);
@@ -490,14 +544,7 @@ fn draw_line(
     }
 }
 
-fn draw_scatter(
-    pixmap: &mut Pixmap,
-    x: &[f64],
-    y: &[f64],
-    color: [u8; 4],
-    size: f32,
-    ct: &CoordTransform,
-) {
+fn draw_scatter(pixmap: &mut Pixmap, x: &[f64], y: &[f64], color: [u8; 4], size: f32, ct: &CoordTransform) {
     let paint = paint_from_rgba(color);
     for i in 0..x.len().min(y.len()) {
         let (px, py) = ct.data_to_pixel(x[i], y[i]);
@@ -510,25 +557,17 @@ fn draw_scatter(
 }
 
 fn draw_imshow(
-    pixmap: &mut Pixmap,
-    data: &[f64],
-    rows: usize,
-    cols: usize,
-    vmin: f64,
-    vmax: f64,
-    ct: &CoordTransform,
+    pixmap: &mut Pixmap, data: &[f64], rows: usize, cols: usize,
+    vmin: f64, vmax: f64, cmap: &str, ct: &CoordTransform,
 ) {
-    let range = vmax - vmin;
-    let range = if range.abs() < 1e-12 { 1.0 } else { range };
+    let range = if (vmax - vmin).abs() < 1e-12 { 1.0 } else { vmax - vmin };
 
     for row in 0..rows {
         for col in 0..cols {
             let val = data[row * cols + col];
             let t = ((val - vmin) / range).clamp(0.0, 1.0);
-            let color = viridis(t);
+            let color = colormap(cmap, t);
 
-            // Each cell covers [col, col+1] x [row, row+1] in data space
-            // Note: row 0 is at the top (highest y value)
             let (px1, py1) = ct.data_to_pixel(col as f64, (rows - row) as f64);
             let (px2, py2) = ct.data_to_pixel((col + 1) as f64, (rows - row - 1) as f64);
 
@@ -537,7 +576,7 @@ fn draw_imshow(
             let w = (px2 - px1).abs();
             let h = (py2 - py1).abs();
 
-            if let Some(rect) = Rect::from_xywh(left, top, w.max(1.0), h.max(1.0)) {
+            if let Some(rect) = Rect::from_xywh(left, top, w.max(0.5), h.max(0.5)) {
                 let paint = paint_from_rgba(color);
                 pixmap.fill_rect(rect, &paint, Transform::identity(), None);
             }
@@ -545,40 +584,102 @@ fn draw_imshow(
     }
 }
 
-/// Viridis colormap: maps t in [0, 1] to RGBA.
-fn viridis(t: f64) -> [u8; 4] {
-    // 9-stop approximation of matplotlib's viridis
-    const STOPS: [(f64, [u8; 3]); 9] = [
-        (0.000, [68, 1, 84]),
-        (0.125, [72, 36, 117]),
-        (0.250, [64, 67, 135]),
-        (0.375, [52, 94, 141]),
-        (0.500, [33, 145, 140]),
-        (0.625, [53, 183, 121]),
-        (0.750, [109, 205, 89]),
-        (0.875, [180, 222, 44]),
-        (1.000, [253, 231, 37]),
+// ---------------------------------------------------------------------------
+// Overlay drawing
+// ---------------------------------------------------------------------------
+
+fn draw_overlay_circle(pixmap: &mut Pixmap, x: f32, y: f32, radius: f32, color: [u8; 4], filled: bool, linewidth: f32) {
+    let mut pb = PathBuilder::new();
+    pb.push_circle(x, y, radius);
+    if let Some(path) = pb.finish() {
+        if filled {
+            let paint = paint_from_rgba(color);
+            pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        } else {
+            // Black outline for contrast
+            if linewidth >= 1.0 {
+                let outline_paint = paint_from_rgba([0, 0, 0, color[3] / 2]);
+                let mut outline_stroke = Stroke::default();
+                outline_stroke.width = linewidth + 2.0;
+                pixmap.stroke_path(&path, &outline_paint, &outline_stroke, Transform::identity(), None);
+            }
+            let paint = paint_from_rgba(color);
+            let mut stroke = Stroke::default();
+            stroke.width = linewidth;
+            pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        }
+    }
+}
+
+fn draw_overlay_crosshair(pixmap: &mut Pixmap, x: f32, y: f32, size: f32, gap: f32, color: [u8; 4], linewidth: f32) {
+    let arms: [(f32, f32, f32, f32); 4] = [
+        (x, y - size, x, y - gap),  // top
+        (x, y + gap, x, y + size),  // bottom
+        (x - size, y, x - gap, y),  // left
+        (x + gap, y, x + size, y),  // right
     ];
 
-    let t = t.clamp(0.0, 1.0);
+    for (x1, y1, x2, y2) in &arms {
+        if let Some(path) = line_path(*x1, *y1, *x2, *y2) {
+            // Black outline
+            let outline_paint = paint_from_rgba([0, 0, 0, color[3] / 2]);
+            let mut outline_stroke = Stroke::default();
+            outline_stroke.width = linewidth + 2.0;
+            outline_stroke.line_cap = LineCap::Round;
+            pixmap.stroke_path(&path, &outline_paint, &outline_stroke, Transform::identity(), None);
 
-    // Find the two stops to interpolate between
-    let mut i = 0;
-    while i < STOPS.len() - 2 && STOPS[i + 1].0 < t {
-        i += 1;
+            // Colored stroke
+            let paint = paint_from_rgba(color);
+            let mut stroke = Stroke::default();
+            stroke.width = linewidth;
+            stroke.line_cap = LineCap::Round;
+            pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        }
+    }
+}
+
+fn draw_overlay_polyline(pixmap: &mut Pixmap, xs: &[f32], ys: &[f32], color: [u8; 4], linewidth: f32) {
+    if xs.len() < 2 { return; }
+    let mut pb = PathBuilder::new();
+    pb.move_to(xs[0], ys[0]);
+    for i in 1..xs.len().min(ys.len()) {
+        pb.line_to(xs[i], ys[i]);
+    }
+    if let Some(path) = pb.finish() {
+        let paint = paint_from_rgba(color);
+        let mut stroke = Stroke::default();
+        stroke.width = linewidth;
+        stroke.line_cap = LineCap::Round;
+        stroke.line_join = LineJoin::Round;
+        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+}
+
+fn draw_overlay_label(
+    pixmap: &mut Pixmap, x: f32, y: f32, label_text: &str,
+    font_size: f32, color: [u8; 4], bg_color: Option<[u8; 4]>, _rotation: f32,
+) {
+    let tw = text::measure_text(label_text, font_size);
+    let pad = 3.0;
+
+    // Background box
+    if let Some(bg) = bg_color {
+        let bx = x - pad;
+        let by = y - font_size - pad;
+        let bw = tw + pad * 2.0;
+        let bh = font_size + pad * 2.0;
+        if let Some(rect) = Rect::from_xywh(bx, by, bw, bh) {
+            let paint = paint_from_rgba(bg);
+            pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+        }
     }
 
-    let (t0, c0) = STOPS[i];
-    let (t1, c1) = STOPS[i + 1];
-    let f = ((t - t0) / (t1 - t0)).clamp(0.0, 1.0);
-
-    [
-        (c0[0] as f64 + (c1[0] as f64 - c0[0] as f64) * f) as u8,
-        (c0[1] as f64 + (c1[1] as f64 - c0[1] as f64) * f) as u8,
-        (c0[2] as f64 + (c1[2] as f64 - c0[2] as f64) * f) as u8,
-        255,
-    ]
+    text::draw_text(pixmap, label_text, x, y, font_size, color);
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn line_path(x1: f32, y1: f32, x2: f32, y2: f32) -> Option<Path> {
     let mut pb = PathBuilder::new();
