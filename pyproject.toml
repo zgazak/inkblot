@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
 
 [project]
 name = "inkblot"
@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = "MIT"
 keywords = ["plotting", "visualization", "scientific", "astronomy"]
 classifiers = [
-    "Development Status :: 1 - Planning",
+    "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
@@ -25,8 +25,7 @@ dependencies = [
 Homepage = "https://github.com/zgazak/inkblot"
 Repository = "https://github.com/zgazak/inkblot"
 
-[tool.hatch.build.targets.wheel]
-packages = ["inkblot"]
-
-[dependency-groups]
-dev = []
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "."
+module-name = "inkblot._core"
