@@ -10,3 +10,9 @@ wheels/
 # Rust
 target/
 Cargo.lock
+
+# Build artifacts
+*.so
+*.pyd
+*.dll
+examples/*.png
