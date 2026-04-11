@@ -85,17 +85,23 @@ class Figure:
         })
         return self
 
-    def imshow(self, data, *, vmin=None, vmax=None, cmap=None):
-        """Add a 2D array as a heatmap image."""
+    def imshow(self, data, *, vmin=None, vmax=None, cmap=None, alpha=1.0,
+               origin="upper"):
+        """Add a 2D array as a heatmap image.
+
+        Args:
+            alpha: opacity (0.0-1.0). Values < 1.0 blend over existing content.
+            origin: "upper" (default) or "lower" (FITS convention, row 0 at bottom).
+        """
         arr = np.asarray(data, dtype=np.float64)
         if arr.ndim != 2:
             raise ValueError("imshow requires a 2D array")
         rows, cols = arr.shape
         flat = arr.ravel().tolist()
         if vmin is None:
-            vmin = float(np.nanmin(arr))
+            vmin = float(np.nanmin(arr[np.isfinite(arr)])) if np.any(np.isfinite(arr)) else 0.0
         if vmax is None:
-            vmax = float(np.nanmax(arr))
+            vmax = float(np.nanmax(arr[np.isfinite(arr)])) if np.any(np.isfinite(arr)) else 1.0
         self._traces.append({
             "kind": "imshow",
             "data": flat,
@@ -104,6 +110,8 @@ class Figure:
             "vmin": float(vmin),
             "vmax": float(vmax),
             "cmap": cmap or self._cmap or "viridis",
+            "alpha": float(alpha),
+            "origin_lower": origin == "lower",
         })
         return self
 
@@ -199,7 +207,7 @@ class Figure:
         })
         return self
 
-    def polyline(self, xs, ys, *, color="white", linewidth=1.0):
+    def polyline(self, xs, ys, *, color="white", linewidth=1.0, dashed=False):
         """Add a polyline overlay."""
         pxs, pys = [], []
         for wx, wy in zip(xs, ys):
@@ -211,12 +219,13 @@ class Figure:
             "xs": pxs, "ys": pys,
             "color": resolve_color(color),
             "linewidth": float(linewidth),
+            "dashed": bool(dashed),
         })
         return self
 
     def label(self, x, y, text, *, font_size=12.0, color="white",
-              bg_color=None, rotation=0.0):
-        """Add a text label overlay with optional background box."""
+              bg_color=None, rotation=0.0, stroke=False):
+        """Add a text label overlay with optional background box and stroke outline."""
         px, py = self._resolve_coords(x, y)
         self._overlays.append({
             "kind": "label",
@@ -226,6 +235,50 @@ class Figure:
             "color": resolve_color(color),
             "bg_color": resolve_color(bg_color) if bg_color else None,
             "rotation": float(rotation),
+            "stroke": bool(stroke),
+        })
+        return self
+
+    def rect(self, x, y, w, h, *, color="green", filled=False, linewidth=1.5):
+        """Add a rectangle overlay. (x, y) is top-left corner."""
+        px, py = self._resolve_coords(x, y)
+        self._overlays.append({
+            "kind": "rect",
+            "x": px, "y": py,
+            "w": float(w), "h": float(h),
+            "color": resolve_color(color),
+            "filled": bool(filled),
+            "linewidth": float(linewidth),
+        })
+        return self
+
+    def polygon(self, xs, ys, *, color="white", linewidth=1.5, filled=False):
+        """Add a closed polygon overlay (e.g. diamond marker)."""
+        pxs, pys = [], []
+        for wx, wy in zip(xs, ys):
+            px, py = self._resolve_coords(wx, wy)
+            pxs.append(px)
+            pys.append(py)
+        self._overlays.append({
+            "kind": "polygon",
+            "xs": pxs, "ys": pys,
+            "color": resolve_color(color),
+            "linewidth": float(linewidth),
+            "filled": bool(filled),
+        })
+        return self
+
+    def diamond(self, x, y, *, size=8, color="white", linewidth=1.5):
+        """Add a diamond marker overlay."""
+        px, py = self._resolve_coords(x, y)
+        r = float(size)
+        self._overlays.append({
+            "kind": "polygon",
+            "xs": [px, px + r, px, px - r],
+            "ys": [py - r, py, py + r, py],
+            "color": resolve_color(color),
+            "linewidth": float(linewidth),
+            "filled": False,
         })
         return self
 

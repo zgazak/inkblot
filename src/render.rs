@@ -42,6 +42,8 @@ pub enum Trace {
         vmin: f64,
         vmax: f64,
         cmap: String,
+        alpha: f32,
+        origin_lower: bool,
     },
 }
 
@@ -67,6 +69,23 @@ pub enum Overlay {
         ys: Vec<f32>,
         color: [u8; 4],
         linewidth: f32,
+        dashed: bool,
+    },
+    Rect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: [u8; 4],
+        filled: bool,
+        linewidth: f32,
+    },
+    Polygon {
+        xs: Vec<f32>,
+        ys: Vec<f32>,
+        color: [u8; 4],
+        linewidth: f32,
+        filled: bool,
     },
     Label {
         x: f32,
@@ -76,6 +95,7 @@ pub enum Overlay {
         color: [u8; 4],
         bg_color: Option<[u8; 4]>,
         rotation: f32,
+        stroke: bool,
     },
 }
 
@@ -206,7 +226,9 @@ impl PlotSpec {
                     let vmin: f64 = d.get_item("vmin")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("vmin"))?.extract()?;
                     let vmax: f64 = d.get_item("vmax")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("vmax"))?.extract()?;
                     let cmap: String = d.get_item("cmap")?.map(|v| v.extract().unwrap_or_else(|_| "viridis".to_string())).unwrap_or_else(|| "viridis".to_string());
-                    traces.push(Trace::Imshow { data, rows, cols, vmin, vmax, cmap });
+                    let alpha: f32 = d.get_item("alpha")?.map(|v| v.extract().unwrap_or(1.0)).unwrap_or(1.0);
+                    let origin_lower: bool = d.get_item("origin_lower")?.map(|v| v.extract().unwrap_or(false)).unwrap_or(false);
+                    traces.push(Trace::Imshow { data, rows, cols, vmin, vmax, cmap, alpha, origin_lower });
                 }
                 other => {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!("unknown trace kind: {other}")));
@@ -250,6 +272,7 @@ impl PlotSpec {
                                 ys: d.get_item("ys")?.unwrap().extract()?,
                                 color: extract_color(d, "color")?,
                                 linewidth: d.get_item("linewidth")?.map(|v| v.extract().unwrap_or(1.0)).unwrap_or(1.0),
+                                dashed: d.get_item("dashed")?.map(|v| v.extract().unwrap_or(false)).unwrap_or(false),
                             });
                         }
                         "label" => {
@@ -261,6 +284,27 @@ impl PlotSpec {
                                 color: extract_color(d, "color")?,
                                 bg_color: extract_optional_color(d, "bg_color")?,
                                 rotation: d.get_item("rotation")?.map(|v| v.extract().unwrap_or(0.0)).unwrap_or(0.0),
+                                stroke: d.get_item("stroke")?.map(|v| v.extract().unwrap_or(false)).unwrap_or(false),
+                            });
+                        }
+                        "rect" => {
+                            overlays.push(Overlay::Rect {
+                                x: d.get_item("x")?.unwrap().extract()?,
+                                y: d.get_item("y")?.unwrap().extract()?,
+                                w: d.get_item("w")?.unwrap().extract()?,
+                                h: d.get_item("h")?.unwrap().extract()?,
+                                color: extract_color(d, "color")?,
+                                filled: d.get_item("filled")?.map(|v| v.extract().unwrap_or(false)).unwrap_or(false),
+                                linewidth: d.get_item("linewidth")?.map(|v| v.extract().unwrap_or(1.5)).unwrap_or(1.5),
+                            });
+                        }
+                        "polygon" => {
+                            overlays.push(Overlay::Polygon {
+                                xs: d.get_item("xs")?.unwrap().extract()?,
+                                ys: d.get_item("ys")?.unwrap().extract()?,
+                                color: extract_color(d, "color")?,
+                                linewidth: d.get_item("linewidth")?.map(|v| v.extract().unwrap_or(1.5)).unwrap_or(1.5),
+                                filled: d.get_item("filled")?.map(|v| v.extract().unwrap_or(false)).unwrap_or(false),
                             });
                         }
                         other => {
@@ -311,8 +355,8 @@ pub fn render_plot(spec: &PlotSpec) -> PyResult<Vec<u8>> {
 
         for trace in &spec.traces {
             match trace {
-                Trace::Imshow { data, rows, cols, vmin, vmax, cmap } => {
-                    draw_imshow(&mut pixmap, data, *rows, *cols, *vmin, *vmax, cmap, &ct);
+                Trace::Imshow { data, rows, cols, vmin, vmax, cmap, alpha, origin_lower } => {
+                    draw_imshow(&mut pixmap, data, *rows, *cols, *vmin, *vmax, cmap, *alpha, *origin_lower, &ct);
                 }
                 Trace::Line { x, y, color, linewidth } => {
                     draw_line(&mut pixmap, x, y, *color, *linewidth, &ct);
@@ -350,7 +394,7 @@ pub fn render_plot(spec: &PlotSpec) -> PyResult<Vec<u8>> {
             match trace {
                 Trace::Line { x, y, color, linewidth } => draw_line(&mut pixmap, x, y, *color, *linewidth, &ct),
                 Trace::Scatter { x, y, color, size } => draw_scatter(&mut pixmap, x, y, *color, *size, &ct),
-                Trace::Imshow { data, rows, cols, vmin, vmax, cmap } => draw_imshow(&mut pixmap, data, *rows, *cols, *vmin, *vmax, cmap, &ct),
+                Trace::Imshow { data, rows, cols, vmin, vmax, cmap, alpha, origin_lower } => draw_imshow(&mut pixmap, data, *rows, *cols, *vmin, *vmax, cmap, *alpha, *origin_lower, &ct),
             }
         }
 
@@ -377,11 +421,17 @@ pub fn render_plot(spec: &PlotSpec) -> PyResult<Vec<u8>> {
             Overlay::Crosshair { x, y, size, gap, color, linewidth } => {
                 draw_overlay_crosshair(&mut pixmap, *x, *y, *size, *gap, *color, *linewidth);
             }
-            Overlay::Polyline { xs, ys, color, linewidth } => {
-                draw_overlay_polyline(&mut pixmap, xs, ys, *color, *linewidth);
+            Overlay::Polyline { xs, ys, color, linewidth, dashed } => {
+                draw_overlay_polyline(&mut pixmap, xs, ys, *color, *linewidth, *dashed);
             }
-            Overlay::Label { x, y, text, font_size, color, bg_color, rotation } => {
-                draw_overlay_label(&mut pixmap, *x, *y, text, *font_size, *color, *bg_color, *rotation);
+            Overlay::Rect { x, y, w, h, color, filled, linewidth } => {
+                draw_overlay_rect(&mut pixmap, *x, *y, *w, *h, *color, *filled, *linewidth);
+            }
+            Overlay::Polygon { xs, ys, color, linewidth, filled } => {
+                draw_overlay_polygon(&mut pixmap, xs, ys, *color, *linewidth, *filled);
+            }
+            Overlay::Label { x, y, text, font_size, color, bg_color, rotation, stroke } => {
+                draw_overlay_label(&mut pixmap, *x, *y, text, *font_size, *color, *bg_color, *rotation, *stroke);
             }
         }
     }
@@ -558,27 +608,61 @@ fn draw_scatter(pixmap: &mut Pixmap, x: &[f64], y: &[f64], color: [u8; 4], size:
 
 fn draw_imshow(
     pixmap: &mut Pixmap, data: &[f64], rows: usize, cols: usize,
-    vmin: f64, vmax: f64, cmap: &str, ct: &CoordTransform,
+    vmin: f64, vmax: f64, cmap: &str, alpha: f32, origin_lower: bool,
+    ct: &CoordTransform,
 ) {
     let range = if (vmax - vmin).abs() < 1e-12 { 1.0 } else { vmax - vmin };
+    let alpha_u8 = (alpha.clamp(0.0, 1.0) * 255.0) as u8;
+    let is_opaque = alpha_u8 == 255;
 
     for row in 0..rows {
         for col in 0..cols {
             let val = data[row * cols + col];
-            let t = ((val - vmin) / range).clamp(0.0, 1.0);
-            let color = colormap(cmap, t);
+            if !val.is_finite() { continue; } // NaN/Inf → transparent
 
-            let (px1, py1) = ct.data_to_pixel(col as f64, (rows - row) as f64);
-            let (px2, py2) = ct.data_to_pixel((col + 1) as f64, (rows - row - 1) as f64);
+            let t = ((val - vmin) / range).clamp(0.0, 1.0);
+            let mut color = colormap(cmap, t);
+            color[3] = alpha_u8;
+
+            // Row mapping: origin_lower means row 0 is at the bottom
+            let data_row = if origin_lower { row } else { rows - 1 - row };
+            let (px1, py1) = ct.data_to_pixel(col as f64, (data_row + 1) as f64);
+            let (px2, py2) = ct.data_to_pixel((col + 1) as f64, data_row as f64);
 
             let left = px1.min(px2);
             let top = py1.min(py2);
             let w = (px2 - px1).abs();
             let h = (py2 - py1).abs();
 
-            if let Some(rect) = Rect::from_xywh(left, top, w.max(0.5), h.max(0.5)) {
-                let paint = paint_from_rgba(color);
-                pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+            if is_opaque {
+                if let Some(rect) = Rect::from_xywh(left, top, w.max(0.5), h.max(0.5)) {
+                    let paint = paint_from_rgba(color);
+                    pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+                }
+            } else {
+                // Alpha-blended: write directly to pixel buffer
+                let px_x = left as i32;
+                let px_y = top as i32;
+                let pw = pixmap.width() as i32;
+                let ph = pixmap.height() as i32;
+                let w_i = w.ceil() as i32;
+                let h_i = h.ceil() as i32;
+                let pdata = pixmap.data_mut();
+                let a = alpha_u8 as u16;
+                let inv = 255 - a;
+                for dy in 0..h_i {
+                    for dx in 0..w_i {
+                        let fx = px_x + dx;
+                        let fy = px_y + dy;
+                        if fx >= 0 && fy >= 0 && fx < pw && fy < ph {
+                            let idx = (fy as usize * pw as usize + fx as usize) * 4;
+                            pdata[idx]     = ((color[0] as u16 * a + pdata[idx] as u16 * inv) / 255) as u8;
+                            pdata[idx + 1] = ((color[1] as u16 * a + pdata[idx + 1] as u16 * inv) / 255) as u8;
+                            pdata[idx + 2] = ((color[2] as u16 * a + pdata[idx + 2] as u16 * inv) / 255) as u8;
+                            pdata[idx + 3] = 255;
+                        }
+                    }
+                }
             }
         }
     }
@@ -638,7 +722,7 @@ fn draw_overlay_crosshair(pixmap: &mut Pixmap, x: f32, y: f32, size: f32, gap: f
     }
 }
 
-fn draw_overlay_polyline(pixmap: &mut Pixmap, xs: &[f32], ys: &[f32], color: [u8; 4], linewidth: f32) {
+fn draw_overlay_polyline(pixmap: &mut Pixmap, xs: &[f32], ys: &[f32], color: [u8; 4], linewidth: f32, dashed: bool) {
     if xs.len() < 2 { return; }
     let mut pb = PathBuilder::new();
     pb.move_to(xs[0], ys[0]);
@@ -651,13 +735,67 @@ fn draw_overlay_polyline(pixmap: &mut Pixmap, xs: &[f32], ys: &[f32], color: [u8
         stroke.width = linewidth;
         stroke.line_cap = LineCap::Round;
         stroke.line_join = LineJoin::Round;
+        if dashed {
+            stroke.dash = StrokeDash::new(vec![8.0, 5.0], 0.0);
+        }
         pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+}
+
+fn draw_overlay_rect(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, color: [u8; 4], filled: bool, linewidth: f32) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(x, y);
+    pb.line_to(x + w, y);
+    pb.line_to(x + w, y + h);
+    pb.line_to(x, y + h);
+    pb.close();
+    if let Some(path) = pb.finish() {
+        if filled {
+            let paint = paint_from_rgba(color);
+            pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        } else {
+            let paint = paint_from_rgba(color);
+            let mut stroke = Stroke::default();
+            stroke.width = linewidth;
+            stroke.line_join = LineJoin::Miter;
+            pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        }
+    }
+}
+
+fn draw_overlay_polygon(pixmap: &mut Pixmap, xs: &[f32], ys: &[f32], color: [u8; 4], linewidth: f32, filled: bool) {
+    if xs.len() < 3 { return; }
+    let mut pb = PathBuilder::new();
+    pb.move_to(xs[0], ys[0]);
+    for i in 1..xs.len().min(ys.len()) {
+        pb.line_to(xs[i], ys[i]);
+    }
+    pb.close();
+    if let Some(path) = pb.finish() {
+        if filled {
+            let paint = paint_from_rgba(color);
+            pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        } else {
+            // Outline stroke for contrast
+            let outline_paint = paint_from_rgba([0, 0, 0, color[3] / 2]);
+            let mut outline_stroke = Stroke::default();
+            outline_stroke.width = linewidth + 2.0;
+            outline_stroke.line_join = LineJoin::Miter;
+            pixmap.stroke_path(&path, &outline_paint, &outline_stroke, Transform::identity(), None);
+
+            let paint = paint_from_rgba(color);
+            let mut stroke = Stroke::default();
+            stroke.width = linewidth;
+            stroke.line_join = LineJoin::Miter;
+            pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        }
     }
 }
 
 fn draw_overlay_label(
     pixmap: &mut Pixmap, x: f32, y: f32, label_text: &str,
     font_size: f32, color: [u8; 4], bg_color: Option<[u8; 4]>, _rotation: f32,
+    stroke: bool,
 ) {
     let tw = text::measure_text(label_text, font_size);
     let pad = 3.0;
@@ -672,6 +810,14 @@ fn draw_overlay_label(
             let paint = paint_from_rgba(bg);
             pixmap.fill_rect(rect, &paint, Transform::identity(), None);
         }
+    }
+
+    // Text stroke outline for contrast (draw black text underneath)
+    if stroke {
+        text::draw_text(pixmap, label_text, x - 1.0, y, font_size, [0, 0, 0, color[3]]);
+        text::draw_text(pixmap, label_text, x + 1.0, y, font_size, [0, 0, 0, color[3]]);
+        text::draw_text(pixmap, label_text, x, y - 1.0, font_size, [0, 0, 0, color[3]]);
+        text::draw_text(pixmap, label_text, x, y + 1.0, font_size, [0, 0, 0, color[3]]);
     }
 
     text::draw_text(pixmap, label_text, x, y, font_size, color);
