@@ -44,6 +44,7 @@ pub enum Trace {
         cmap: String,
         alpha: f32,
         origin_lower: bool,
+        extent: Option<[f64; 4]>, // [x_min, x_max, y_min, y_max] in pixels
     },
 }
 
@@ -228,7 +229,14 @@ impl PlotSpec {
                     let cmap: String = d.get_item("cmap")?.map(|v| v.extract().unwrap_or_else(|_| "viridis".to_string())).unwrap_or_else(|| "viridis".to_string());
                     let alpha: f32 = d.get_item("alpha")?.map(|v| v.extract().unwrap_or(1.0)).unwrap_or(1.0);
                     let origin_lower: bool = d.get_item("origin_lower")?.map(|v| v.extract().unwrap_or(false)).unwrap_or(false);
-                    traces.push(Trace::Imshow { data, rows, cols, vmin, vmax, cmap, alpha, origin_lower });
+                    let extent: Option<[f64; 4]> = match d.get_item("extent")? {
+                        Some(v) if !v.is_none() => {
+                            let e: Vec<f64> = v.extract()?;
+                            if e.len() == 4 { Some([e[0], e[1], e[2], e[3]]) } else { None }
+                        }
+                        _ => None,
+                    };
+                    traces.push(Trace::Imshow { data, rows, cols, vmin, vmax, cmap, alpha, origin_lower, extent });
                 }
                 other => {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!("unknown trace kind: {other}")));
@@ -355,8 +363,8 @@ pub fn render_plot(spec: &PlotSpec) -> PyResult<Vec<u8>> {
 
         for trace in &spec.traces {
             match trace {
-                Trace::Imshow { data, rows, cols, vmin, vmax, cmap, alpha, origin_lower } => {
-                    draw_imshow(&mut pixmap, data, *rows, *cols, *vmin, *vmax, cmap, *alpha, *origin_lower, &ct);
+                Trace::Imshow { data, rows, cols, vmin, vmax, cmap, alpha, origin_lower, extent } => {
+                    draw_imshow(&mut pixmap, data, *rows, *cols, *vmin, *vmax, cmap, *alpha, *origin_lower, extent.as_ref(), &ct);
                 }
                 Trace::Line { x, y, color, linewidth } => {
                     draw_line(&mut pixmap, x, y, *color, *linewidth, &ct);
@@ -394,7 +402,7 @@ pub fn render_plot(spec: &PlotSpec) -> PyResult<Vec<u8>> {
             match trace {
                 Trace::Line { x, y, color, linewidth } => draw_line(&mut pixmap, x, y, *color, *linewidth, &ct),
                 Trace::Scatter { x, y, color, size } => draw_scatter(&mut pixmap, x, y, *color, *size, &ct),
-                Trace::Imshow { data, rows, cols, vmin, vmax, cmap, alpha, origin_lower } => draw_imshow(&mut pixmap, data, *rows, *cols, *vmin, *vmax, cmap, *alpha, *origin_lower, &ct),
+                Trace::Imshow { data, rows, cols, vmin, vmax, cmap, alpha, origin_lower, extent } => draw_imshow(&mut pixmap, data, *rows, *cols, *vmin, *vmax, cmap, *alpha, *origin_lower, extent.as_ref(), &ct),
             }
         }
 
@@ -609,63 +617,139 @@ fn draw_scatter(pixmap: &mut Pixmap, x: &[f64], y: &[f64], color: [u8; 4], size:
 fn draw_imshow(
     pixmap: &mut Pixmap, data: &[f64], rows: usize, cols: usize,
     vmin: f64, vmax: f64, cmap: &str, alpha: f32, origin_lower: bool,
-    ct: &CoordTransform,
+    extent: Option<&[f64; 4]>, ct: &CoordTransform,
 ) {
     let range = if (vmax - vmin).abs() < 1e-12 { 1.0 } else { vmax - vmin };
     let alpha_u8 = (alpha.clamp(0.0, 1.0) * 255.0) as u8;
-    let is_opaque = alpha_u8 == 255;
+    let pw = pixmap.width() as i32;
+    let ph = pixmap.height() as i32;
 
-    for row in 0..rows {
-        for col in 0..cols {
-            let val = data[row * cols + col];
-            if !val.is_finite() { continue; } // NaN/Inf → transparent
+    if let Some(ext) = extent {
+        // Extent mode: data array is smaller than output region.
+        // Iterate over output pixels in the extent region, bilinear-sample from data.
+        let ext_x0 = ext[0]; // pixel x min
+        let ext_x1 = ext[1]; // pixel x max
+        let ext_y0 = ext[2]; // pixel y min (bottom in lower-origin)
+        let ext_y1 = ext[3]; // pixel y max (top in lower-origin)
 
-            let t = ((val - vmin) / range).clamp(0.0, 1.0);
-            let mut color = colormap(cmap, t);
-            color[3] = alpha_u8;
+        let out_x0 = ext_x0.floor().max(0.0) as i32;
+        let out_x1 = ext_x1.ceil().min(pw as f64) as i32;
+        // In screen coords, y0 (bottom) maps to higher screen y
+        let screen_y_top = if origin_lower { (ph as f64 - ext_y1).floor().max(0.0) as i32 } else { ext_y0.floor().max(0.0) as i32 };
+        let screen_y_bot = if origin_lower { (ph as f64 - ext_y0).ceil().min(ph as f64) as i32 } else { ext_y1.ceil().min(ph as f64) as i32 };
 
-            // Row mapping: origin_lower means row 0 is at the bottom
-            let data_row = if origin_lower { row } else { rows - 1 - row };
-            let (px1, py1) = ct.data_to_pixel(col as f64, (data_row + 1) as f64);
-            let (px2, py2) = ct.data_to_pixel((col + 1) as f64, data_row as f64);
+        let pdata = pixmap.data_mut();
+        let a = alpha_u8 as u16;
+        let inv_a = 255 - a;
 
-            let left = px1.min(px2);
-            let top = py1.min(py2);
-            let w = (px2 - px1).abs();
-            let h = (py2 - py1).abs();
+        for sy in screen_y_top..screen_y_bot {
+            for sx in out_x0..out_x1 {
+                // Map screen pixel to data array coordinates
+                let frac_x = (sx as f64 - ext_x0) / (ext_x1 - ext_x0) * cols as f64 - 0.5;
+                let frac_y = if origin_lower {
+                    ((ph as f64 - 1.0 - sy as f64) - ext_y0) / (ext_y1 - ext_y0) * rows as f64 - 0.5
+                } else {
+                    (sy as f64 - ext_y0) / (ext_y1 - ext_y0) * rows as f64 - 0.5
+                };
 
-            if is_opaque {
-                if let Some(rect) = Rect::from_xywh(left, top, w.max(0.5), h.max(0.5)) {
-                    let paint = paint_from_rgba(color);
-                    pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+                let val = bilinear_sample(data, rows, cols, frac_x, frac_y);
+                if !val.is_finite() { continue; }
+
+                let t = ((val - vmin) / range).clamp(0.0, 1.0);
+                let color = colormap(cmap, t);
+
+                let idx = (sy as usize * pw as usize + sx as usize) * 4;
+                if a == 255 {
+                    pdata[idx]     = color[0];
+                    pdata[idx + 1] = color[1];
+                    pdata[idx + 2] = color[2];
+                    pdata[idx + 3] = 255;
+                } else {
+                    pdata[idx]     = ((color[0] as u16 * a + pdata[idx] as u16 * inv_a) / 255) as u8;
+                    pdata[idx + 1] = ((color[1] as u16 * a + pdata[idx + 1] as u16 * inv_a) / 255) as u8;
+                    pdata[idx + 2] = ((color[2] as u16 * a + pdata[idx + 2] as u16 * inv_a) / 255) as u8;
+                    pdata[idx + 3] = 255;
                 }
-            } else {
-                // Alpha-blended: write directly to pixel buffer
-                let px_x = left as i32;
-                let px_y = top as i32;
-                let pw = pixmap.width() as i32;
-                let ph = pixmap.height() as i32;
-                let w_i = w.ceil() as i32;
-                let h_i = h.ceil() as i32;
-                let pdata = pixmap.data_mut();
-                let a = alpha_u8 as u16;
-                let inv = 255 - a;
-                for dy in 0..h_i {
-                    for dx in 0..w_i {
-                        let fx = px_x + dx;
-                        let fy = px_y + dy;
-                        if fx >= 0 && fy >= 0 && fx < pw && fy < ph {
-                            let idx = (fy as usize * pw as usize + fx as usize) * 4;
-                            pdata[idx]     = ((color[0] as u16 * a + pdata[idx] as u16 * inv) / 255) as u8;
-                            pdata[idx + 1] = ((color[1] as u16 * a + pdata[idx + 1] as u16 * inv) / 255) as u8;
-                            pdata[idx + 2] = ((color[2] as u16 * a + pdata[idx + 2] as u16 * inv) / 255) as u8;
-                            pdata[idx + 3] = 255;
+            }
+        }
+    } else {
+        // No extent: 1:1 mapping, one data cell per output pixel region
+        let is_opaque = alpha_u8 == 255;
+        for row in 0..rows {
+            for col in 0..cols {
+                let val = data[row * cols + col];
+                if !val.is_finite() { continue; }
+
+                let t = ((val - vmin) / range).clamp(0.0, 1.0);
+                let mut color = colormap(cmap, t);
+                color[3] = alpha_u8;
+
+                let data_row = if origin_lower { row } else { rows - 1 - row };
+                let (px1, py1) = ct.data_to_pixel(col as f64, (data_row + 1) as f64);
+                let (px2, py2) = ct.data_to_pixel((col + 1) as f64, data_row as f64);
+
+                let left = px1.min(px2);
+                let top = py1.min(py2);
+                let w = (px2 - px1).abs();
+                let h = (py2 - py1).abs();
+
+                if is_opaque {
+                    if let Some(rect) = Rect::from_xywh(left, top, w.max(0.5), h.max(0.5)) {
+                        let paint = paint_from_rgba(color);
+                        pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+                    }
+                } else {
+                    let px_x = left as i32;
+                    let px_y = top as i32;
+                    let w_i = w.ceil() as i32;
+                    let h_i = h.ceil() as i32;
+                    let pdata = pixmap.data_mut();
+                    let a = alpha_u8 as u16;
+                    let inv_a = 255 - a;
+                    for dy in 0..h_i {
+                        for dx in 0..w_i {
+                            let fx = px_x + dx;
+                            let fy = px_y + dy;
+                            if fx >= 0 && fy >= 0 && fx < pw && fy < ph {
+                                let idx = (fy as usize * pw as usize + fx as usize) * 4;
+                                pdata[idx]     = ((color[0] as u16 * a + pdata[idx] as u16 * inv_a) / 255) as u8;
+                                pdata[idx + 1] = ((color[1] as u16 * a + pdata[idx + 1] as u16 * inv_a) / 255) as u8;
+                                pdata[idx + 2] = ((color[2] as u16 * a + pdata[idx + 2] as u16 * inv_a) / 255) as u8;
+                                pdata[idx + 3] = 255;
+                            }
                         }
                     }
                 }
             }
         }
     }
+}
+
+/// Bilinear interpolation from a 2D array. Returns NaN if any neighbor is NaN.
+fn bilinear_sample(data: &[f64], rows: usize, cols: usize, x: f64, y: f64) -> f64 {
+    if x < -0.5 || y < -0.5 || x >= cols as f64 - 0.5 || y >= rows as f64 - 0.5 {
+        return f64::NAN;
+    }
+    let x0 = x.floor().max(0.0) as usize;
+    let y0 = y.floor().max(0.0) as usize;
+    let x1 = (x0 + 1).min(cols - 1);
+    let y1 = (y0 + 1).min(rows - 1);
+    let fx = (x - x0 as f64).clamp(0.0, 1.0);
+    let fy = (y - y0 as f64).clamp(0.0, 1.0);
+
+    let v00 = data[y0 * cols + x0];
+    let v10 = data[y0 * cols + x1];
+    let v01 = data[y1 * cols + x0];
+    let v11 = data[y1 * cols + x1];
+
+    // If any neighbor is NaN, result is NaN (transparent)
+    if !v00.is_finite() || !v10.is_finite() || !v01.is_finite() || !v11.is_finite() {
+        return f64::NAN;
+    }
+
+    let top = v00 * (1.0 - fx) + v10 * fx;
+    let bot = v01 * (1.0 - fx) + v11 * fx;
+    top * (1.0 - fy) + bot * fy
 }
 
 // ---------------------------------------------------------------------------
@@ -680,13 +764,6 @@ fn draw_overlay_circle(pixmap: &mut Pixmap, x: f32, y: f32, radius: f32, color: 
             let paint = paint_from_rgba(color);
             pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
         } else {
-            // Black outline for contrast
-            if linewidth >= 1.0 {
-                let outline_paint = paint_from_rgba([0, 0, 0, color[3] / 2]);
-                let mut outline_stroke = Stroke::default();
-                outline_stroke.width = linewidth + 2.0;
-                pixmap.stroke_path(&path, &outline_paint, &outline_stroke, Transform::identity(), None);
-            }
             let paint = paint_from_rgba(color);
             let mut stroke = Stroke::default();
             stroke.width = linewidth;

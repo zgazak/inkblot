@@ -86,12 +86,15 @@ class Figure:
         return self
 
     def imshow(self, data, *, vmin=None, vmax=None, cmap=None, alpha=1.0,
-               origin="upper"):
+               origin="upper", extent=None):
         """Add a 2D array as a heatmap image.
 
         Args:
             alpha: opacity (0.0-1.0). Values < 1.0 blend over existing content.
             origin: "upper" (default) or "lower" (FITS convention, row 0 at bottom).
+            extent: [x_min, x_max, y_min, y_max] in pixel coords. When set,
+                the data array is stretched to fill this region with bilinear
+                interpolation (like matplotlib's extent + interpolation="bilinear").
         """
         arr = np.asarray(data, dtype=np.float64)
         if arr.ndim != 2:
@@ -102,7 +105,7 @@ class Figure:
             vmin = float(np.nanmin(arr[np.isfinite(arr)])) if np.any(np.isfinite(arr)) else 0.0
         if vmax is None:
             vmax = float(np.nanmax(arr[np.isfinite(arr)])) if np.any(np.isfinite(arr)) else 1.0
-        self._traces.append({
+        trace = {
             "kind": "imshow",
             "data": flat,
             "rows": rows,
@@ -112,7 +115,10 @@ class Figure:
             "cmap": cmap or self._cmap or "viridis",
             "alpha": float(alpha),
             "origin_lower": origin == "lower",
-        })
+        }
+        if extent is not None:
+            trace["extent"] = [float(v) for v in extent]
+        self._traces.append(trace)
         return self
 
     # ── Labels ─────────────────────────────────────────────────────────
